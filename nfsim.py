@@ -3,13 +3,13 @@
 # SmartValidator - simulator component
 # by Tomas Hlavacek (tmshlvck@gmail.com)
 
-debug=0
+debug=1
 status_file='/tmp/smartvalidator_sim'
 #db_host=''
 #db_name=''
 #db_user=''
 #db_passwd=''
-debug_fltr=['1.%d.%d.0/24'%(i,j) for i in range(0,255) for j in range(0,255)]
+debug_fltr=['217.%d.%d.0/24'%(i,i) for i in range(0,255)]
 
 
 import sys
@@ -17,6 +17,12 @@ import os
 import datetime
 import tempfile
 import subprocess
+import getopt
+
+def dbg(text):
+    if debug:
+        print(text)
+
 
 def decode_nfdump_time(filename):
     """
@@ -44,12 +50,19 @@ def filter_newer(files, latest_point):
     return [f for f in files if decode_nfdump_time(f) > latest_point]
 
 
-def write_status(filename, latest_point):
-    # TODO
-    pass
+def write_status(latest_point, filename=status_file):
+    with open(filename, 'w') as fh:
+        fh.write(str(int(latest_point.timestamp())))
 
-def read_status(filename):
-    # TODO
+def read_status(filename=status_file):
+    try:
+        with open(filename, 'r') as fh:
+            l = fh.readline()
+            ts = datetime.datetime.fromtimestamp(int(l))
+            dbg("timestamp read=%s" % str(ts))
+            return ts
+    except:
+        pass
     return datetime.datetime(1970,1,1,0,0)
 
 
@@ -69,11 +82,11 @@ def get_fltr_saved_conflicts():
     return debug_fltr
 
 
-def get_fltr_rpki():
+def get_fltr_raw_rpki():
     return debug_fltr
 
 
-def get_fltr_resolved():
+def get_fltr_resolved_conflicts():
     return debug_fltr
 
 
@@ -105,23 +118,70 @@ class Filter:
         os.remove(self.fn)
 
 
+def process_nfdump_output(stdout):
+    for l in stdout:
+        print(l.decode('ascii').strip())
+
+    # TODO: generate result to be written to DB
+    return None
+
+
 def run_nfdump(nfd_fn, fltr_fn):
-    print('Running nfdump -r %s -f %s' % (nfd_fn, fltr_fn))
+    dbg('Running nfdump -r %s -f %s' % (nfd_fn, fltr_fn))
     p = subprocess.Popen(['nfdump', '-r', nfd_fn, '-f', fltr_fn], stdout=subprocess.PIPE)
-    (output, err) = p.communicate()
-    print(output)
-    exit_code = process.wait()
+    res = process_nfdump_output(p.stdout)
+    exit_code = p.wait()
+    return res
 
 
 def main():
-    rootdir=sys.argv[1]
-    files=filter_newer(sort_nfdump_files(find_files(rootdir)), read_status(status_file))
-    print(str(files))
-    with Filter(get_fltr_rpki()) as f:
-        run_nfdump(files[0], f)
+    def usage():
+        print("""SmartValidator NetFlow simulator
+    %s <-d <dir>> [-hsre]
+        -d | --dir <nfdump data directory>
+        -h | --help
+        -s | --saved -- filters traffic for salvaged invalid ROAs
+        -r | --rpki -- filters traffic dropped by "raw" RPKI
+        -e | --resolved -- filters traffic dropped in Smart mode
+""" % sys.argv[0])
+
+    rootdir=None
+    fltr=None
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "hd:sre", ["help", "dir=", "saved", "rpki", "resolved"])
+    except getopt.GetoptError as err:
+        print(str(err))
+        usage()
+        sys.exit(2)
+    for o, a in opts:
+        if o in ("-h", "--help"):
+            usage()
+            sys.exit()
+        elif o in ("-d", "--dir"):
+            rootdir = a
+        elif o in ("-s", "--saved"):
+            assert fltr == None, "multiple filtering options"
+            fltr = get_fltr_saved_conflicts()
+        elif o in ("-r", "--rpki"):
+            assert fltr == None, "multiple filtering options"
+            fltr = get_fltr_raw_rpki()
+        elif o in ("-e", "--resolved"):
+            assert fltr == None, "multiple filtering options"
+            fltr = get_fltr_resolved_conflicts()
+        else:
+            assert False, "unhandled option"
+
+    assert rootdir, "missing root directory"
+    assert fltr, "missing filter option"
 
 
-
+    files=filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
+    with Filter(fltr) as fl:
+        for fn in files:
+            res = run_nfdump(fn, fl)
+            # TODO: write res to DB
+        write_status(decode_nfdump_time(files[-1]))
 
 
 if __name__ == '__main__':
