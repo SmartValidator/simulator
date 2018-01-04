@@ -11,7 +11,10 @@ db_host=password.db_host
 db_name=password.db_name
 db_user=password.db_user
 db_passwd=password.db_passwd
-#debug_fltr=['217.%d.%d.0/24'%(i,i) for i in range(0,255)]
+
+ports = [80,443,25,110,143,53]
+protocols = [6,17]
+
 debug_fltr=['217.31.48.0/20']
 
 
@@ -22,6 +25,7 @@ import tempfile
 import subprocess
 import getopt
 import psycopg2
+import csv
 
 def dbg(text):
     if debug:
@@ -52,6 +56,7 @@ def get_fltr_saved_conflicts():
 
 def get_fltr_raw_rpki():
     # conflicts found by conflict seeker (RIPE validator result)
+    "select prefix from announcements inner join validated_roas_verified_announcements as o on announcements.id = verified_announcement_id where route_validity > 0 and not exists ( select verified_announcement_id from validated_roas_verified_announcements where route_validity = 0 and verified_announcement_id = o.verified_announcement_id ) and family(prefix) = 4 group by prefix;"
     return debug_fltr
 
 
@@ -197,12 +202,55 @@ def process_nfdump_output(stdout):
 
 def process_records(filter_type, records, srcfilename, outdir):
     header = ['date', 'duration', 'protocol', 'src', 'srcport', 'dst', 'dstport', 'packets', 'bytes', 'flows']
-    with open(os.path.join(outdir, '%s.csv' % srcfilename), 'w') as ofh:
+
+    proto_packets = {p:0 for p in protocols}
+    proto_packets[None] = 0
+    proto_bytes = {p:0 for p in protocols}
+    proto_bytes[None] = 0
+
+    port_packets = {p:0 for p in ports}
+    port_packets[None] = 0
+    port_bytes = {p:0 for p in ports}
+    port_bytes[None] = 0
+
+    def update(table, key, value):
+        if key in table:
+            table[key] += value
+        else:
+            table[None] += value
+
+    ofh = None
+    ofw = None
+    if outdir:
+        ofh = open(os.path.join(outdir, '%s.csv' % srcfilename), 'w')
         ofw = csv.writer(ofh, quoting=csv.QUOTE_MINIMAL)
         ofw.writerow(header)
-        for r in records:
-            # write CSV, compute summaries?
+
+    for r in records:
+        # write CSV, compute summaries
+        if ofw:
             ofw.writerow(r)
+
+        update(proto_packets, r[2], r[7])
+        update(proto_bytes, r[2], r[8])
+
+        update(port_packets, r[4], r[7])
+        update(port_bytes, r[4], r[8])
+        update(port_packets, r[6], r[7])
+        update(port_bytes, r[6], r[8])
+
+    if ofh:
+        ofh.close()
+
+    # write report (now stdout, future to DB)
+    print("proto_packets")
+    print(str(proto_packets))
+    print("proto_bytes")
+    print(str(proto_bytes))
+    print("port_packets")
+    print(str(port_packets))
+    print("port_bytes")
+    print(str(port_bytes))
 
 
 def run_nfdump(nfd_fn, fltr_fn):
@@ -223,6 +271,7 @@ def main():
         -s | --saved -- filters traffic for salvaged invalid ROAs
         -r | --rpki -- filters traffic dropped by "raw" RPKI
         -e | --resolved -- filters traffic dropped in Smart mode
+        -o | --outdir <CSV out directory>
 """ % sys.argv[0])
 
     rootdir = None
@@ -261,7 +310,6 @@ def main():
 
     assert rootdir, "missing root directory"
     assert fltr, "missing filter option"
-
 
     files=filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
     with Filter(fltr) as fl:
