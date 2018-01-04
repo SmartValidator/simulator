@@ -3,20 +3,12 @@
 # SmartValidator - simulator component
 # by Tomas Hlavacek (tmshlvck@gmail.com)
 
-import password
 
 debug=0
 status_file='/tmp/smartvalidator_sim'
-db_host=password.db_host
-db_name=password.db_name
-db_user=password.db_user
-db_passwd=password.db_passwd
 
 ports = [80,443,25,110,143,53]
 protocols = [6,17]
-
-debug_fltr=['217.31.48.0/20']
-
 
 import sys
 import os
@@ -24,71 +16,14 @@ import datetime
 import tempfile
 import subprocess
 import getopt
-import psycopg2
 import csv
+import iptree
+import ipaddress
+
 
 def dbg(text):
     if debug:
         print(text)
-
-
-def dbconn():
-    return 'host=%s dbname=%s user=%s password=%s' % (db_host, db_name, db_user, db_passwd)
-
-
-def dbselect(select):
-    conn = psycopg2.connect(dbconn())
-    cur = conn.cursor()
-    cur.execute(select)
-    for r in cur:
-        yield r
-
-    # conn.commit()
-    cur.close()
-    conn.close() 
-
-
-def get_fltr_saved_conflicts():
-    # filtered / whitelisted from validated_roas (difference of our result from RIPE)
-    # return list(dbselect("SELECT prefix FROM validated_roas WHERE filtered = 't';"))
-    return debug_fltr
-
-
-def get_fltr_raw_rpki():
-    # conflicts found by conflict seeker (RIPE validator result)
-    "select prefix from announcements inner join validated_roas_verified_announcements as o on announcements.id = verified_announcement_id where route_validity > 0 and not exists ( select verified_announcement_id from validated_roas_verified_announcements where route_validity = 0 and verified_announcement_id = o.verified_announcement_id ) and family(prefix) = 4 group by prefix;"
-    return debug_fltr
-
-
-def get_fltr_resolved_conflicts():
-    # not filtered / whitelisted from validated_roas (our result)
-    # return list(dbselect("SELECT prefix FROM validated_roas WHERE filtered = 'f' and whitelisted = 'f';"))
-    return debug_fltr
-
-
-#def insert_records(filter_type, records):
-#    """ Using table netflows
-#    filter_type: 1 = fltr_resolved_conflicts (our output)
-#                 2 = fltr_raw_rpki
-#                 3 = fltr_saved_conflicts (difference)
-#
-#    records: list of tuples:
-#        (date, duration, protocol src, srcport, dst, dstport, packets, bytes, flows)
-#    """
-#    
-#    conn = psycopg2.connect(dbconn())
-#    cur = conn.cursor()
-# 
-#    i = 0
-#    for r in records:
-#        #dbg("inserting %s" % str(r))
-#        cur.execute("INSERT INTO netflows (date, duration, protocol, src, srcport, dst, dstport, packets, bytes, flows, filter_type) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);", (r + (filter_type,)))
-#        i+=1
-#        if (i % 1000) == 0:
-#            conn.commit()
-#    conn.commit()
-#    cur.close()
-#    conn.close()
 
 
 def decode_nfdump_time(filename):
@@ -145,33 +80,17 @@ def find_files(rootdir):
                 yield fn
 
 
-
-class Filter:
-    def __init__(self, prefixes, ports=None):
-        self.prefixes = prefixes
-        self.ports = ports
-
-    def __enter__(self):
-        fhos, fn = tempfile.mkstemp()
-        with open(fhos, 'w') as fh:
-            self.fn = fn
-            if self.prefixes:
-                fh.write('(')
-                for p in self.prefixes[:-1]:
-                    fh.write('net %s or \n' % p)
-                fh.write('net %s)\n' % self.prefixes[-1])
-            if self.prefixes and self.ports:
-                fh.write(' and ')
-            if self.ports:
-                fh.write('(')
-                for p in self.ports[:-1]:
-                    fh.write('port %s or \n' % p)
-                fh.write('port %s)\n' % self.ports[-1])
-
-        return self.fn
-
-    def __exit__(self, etype, evalue, etraceback):
-        os.remove(self.fn)
+def read_filter(fltrfn):
+    t = iptree.IPLookupTree(ipv6=False)
+    with open(fltrfn, 'r') as fh:
+        for l in fh:
+            try:
+                ipa = ipaddress.IPv4Address(l)
+                t.add(ipa, True)
+            except:
+                dbg("Ignoring line %s" % l)
+                pass
+    return t
 
 
 def process_nfdump_output(stdout):
@@ -200,7 +119,7 @@ def process_nfdump_output(stdout):
             yield r
 
 
-def process_records(filter_type, records, srcfilename, outdir):
+def process_records(records, fltr, srcfilename, outdir):
     header = ['date', 'duration', 'protocol', 'src', 'srcport', 'dst', 'dstport', 'packets', 'bytes', 'flows']
 
     proto_packets = {p:0 for p in protocols}
@@ -227,6 +146,9 @@ def process_records(filter_type, records, srcfilename, outdir):
         ofw.writerow(header)
 
     for r in records:
+        if not fltr.lookupBest(r[3]) and not fltr.lookupBest(r[5]):
+            continue
+
         # write CSV, compute summaries
         if ofw:
             ofw.writerow(r)
@@ -267,6 +189,7 @@ def main():
         print("""SmartValidator NetFlow simulator
     %s <-d <dir>> [-hsre]
         -d | --dir <nfdump data directory>
+        -f | --filter <IP prefix list>
         -h | --help
         -s | --saved -- filters traffic for salvaged invalid ROAs
         -r | --rpki -- filters traffic dropped by "raw" RPKI
@@ -275,12 +198,11 @@ def main():
 """ % sys.argv[0])
 
     rootdir = None
-    fltr = None
-    filter_type = 0
+    fltrfn = None
     outdir = None
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hd:sreo:", ["help", "dir=", "saved", "rpki", "resolved", "outdir="])
+        opts, args = getopt.getopt(sys.argv[1:], "hd:sreo:f:", ["help", "dir=", "outdir=", "filter="])
     except getopt.GetoptError as err:
         print(str(err))
         usage()
@@ -291,34 +213,23 @@ def main():
             sys.exit()
         elif o in ("-d", "--dir"):
             rootdir = a
-        elif o in ("-s", "--saved"):
-            assert fltr == None, "multiple filtering options"
-            fltr = get_fltr_saved_conflicts()
-            filter_type = 3
-        elif o in ("-r", "--rpki"):
-            assert fltr == None, "multiple filtering options"
-            fltr = get_fltr_raw_rpki()
-            filter_type = 2
-        elif o in ("-e", "--resolved"):
-            assert fltr == None, "multiple filtering options"
-            fltr = get_fltr_resolved_conflicts()
-            filter_type = 1
         elif o in ("-o", "--outdir"):
             outdir = a
+        elif o in ("-f", "--filter" ):
+            filterfn = a
         else:
             assert False, "unhandled option"
 
     assert rootdir, "missing root directory"
     assert fltr, "missing filter option"
 
-    files=filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
-    with Filter(fltr) as fl:
-        for fn in files:
-            (res, proc) = run_nfdump(fn, fl)
-            #insert_records(filter_type, res)
-            process_records(filter_type, res, os.path.split(fn)[-1], outdir)
-            nfdump_exit_code = proc.wait()
-            dbg('nfdump exited with code %d'%nfdump_exit_code)
+    fltr = read_filter(fltrfn)
+    files = filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
+    for fn in files:
+        (res, proc) = run_nfdump(fn)
+        process_records(res, fltr, os.path.split(fn)[-1], outdir)
+        nfdump_exit_code = proc.wait()
+        dbg('nfdump exited with code %d'%nfdump_exit_code)
 
         write_status(decode_nfdump_time(files[-1]))
 
