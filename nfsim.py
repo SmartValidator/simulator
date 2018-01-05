@@ -85,11 +85,10 @@ def read_filter(fltrfn):
     with open(fltrfn, 'r') as fh:
         for l in fh:
             try:
-                ipa = ipaddress.IPv4Address(l)
+                ipa = ipaddress.IPv4Network(l.strip())
                 t.add(ipa, True)
             except:
-                dbg("Ignoring line %s" % l)
-                pass
+                print("Ignoring line %s" % l)
     return t
 
 
@@ -164,27 +163,41 @@ def process_records(records, fltr, srcfilename, outdir):
     if ofh:
         ofh.close()
 
-    # write report (now stdout, future to DB)
-    print("proto_packets")
-    print(str(proto_packets))
-    print("proto_bytes")
-    print(str(proto_bytes))
-    print("port_packets")
-    print(str(port_packets))
-    print("port_bytes")
-    print(str(port_bytes))
+    # write report (now stdout, future to CSV)
+    #print("proto_packets")
+    #print(str(proto_packets))
+    #print("proto_bytes")
+    #print(str(proto_bytes))
+    #print("port_packets")
+    #print(str(port_packets))
+    #print("port_bytes")
+    #print(str(port_bytes))
+    return (proto_packets, proto_bytes, port_packets, port_bytes)
 
 
-def run_nfdump(nfd_fn, fltr_fn):
-    dbg('Running nfdump -N -r %s -f %s' % (nfd_fn, fltr_fn))
-    p = subprocess.Popen(['nfdump', '-N', '-r', nfd_fn, '-f', fltr_fn], stdout=subprocess.PIPE)
+def decode_header():
+    return [["packets_proto_%d" % p for p in protocols]+["packets_proto_other"],
+            ["bytes_proto_%d" % p for p in protocols]+["bytes_proto_other"],
+            ["packets_port_%d" % p for p in ports]+["packets_port_other"],
+            ["bytes_port_%d" % p for p in ports]+["bytes_port_other"]]
+
+
+def decode_rep(report):
+    (proto_packets, proto_bytes, port_packets, port_bytes) = report
+    return [[proto_packets[k] for k in (protocols + [None])],
+            [proto_bytes[k] for k in (protocols + [None])],
+            [port_packets[k] for k in (ports + [None])],
+            [port_bytes[k] for k in (ports + [None])]]
+
+
+def run_nfdump(nfd_fn):
+    dbg('Running nfdump -N -r %s' % (nfd_fn))
+    p = subprocess.Popen(['nfdump', '-N', '-r', nfd_fn], stdout=subprocess.PIPE)
     res = process_nfdump_output(p.stdout)
     return (res, p)
 
 
 def main():
-    dbselect("select * from netflows;")
-
     def usage():
         print("""SmartValidator NetFlow simulator
     %s <-d <dir>> [-hsre]
@@ -195,14 +208,16 @@ def main():
         -r | --rpki -- filters traffic dropped by "raw" RPKI
         -e | --resolved -- filters traffic dropped in Smart mode
         -o | --outdir <CSV out directory>
+        -p | --reportfile <CSV report file>
 """ % sys.argv[0])
 
     rootdir = None
     fltrfn = None
     outdir = None
+    reportfn = None
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hd:sreo:f:", ["help", "dir=", "outdir=", "filter="])
+        opts, args = getopt.getopt(sys.argv[1:], "hd:sreo:f:p:", ["help", "dir=", "outdir=", "filter=", "reportfile="])
     except getopt.GetoptError as err:
         print(str(err))
         usage()
@@ -216,22 +231,35 @@ def main():
         elif o in ("-o", "--outdir"):
             outdir = a
         elif o in ("-f", "--filter" ):
-            filterfn = a
+            fltrfn = a
+        elif o in ("-p", "--reportfile"):
+            reportfn = a
         else:
             assert False, "unhandled option"
 
     assert rootdir, "missing root directory"
-    assert fltr, "missing filter option"
+    assert fltrfn, "missing filter option"
+    assert reportfn, "missing report file name"
 
-    fltr = read_filter(fltrfn)
-    files = filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
-    for fn in files:
+    def worker(fn, fltr, outdir):
         (res, proc) = run_nfdump(fn)
-        process_records(res, fltr, os.path.split(fn)[-1], outdir)
+        rep = process_records(res, fltr, os.path.split(fn)[-1], outdir)
+        #rep = process_records([], fltr, os.path.split(fn)[-1], outdir)
         nfdump_exit_code = proc.wait()
         dbg('nfdump exited with code %d'%nfdump_exit_code)
 
         write_status(decode_nfdump_time(files[-1]))
+
+        return decode_rep(rep)
+
+
+    fltr = read_filter(fltrfn)
+    files = filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
+    with open(reportfn, 'w') as reportfh:
+        reportcsv = csv.writer(reportfh, quoting=csv.QUOTE_MINIMAL)
+        reportcsv.writerow(decode_header())
+        for fn in files:
+            reportcsv.writerow(worker(fn, fltr, outdir))
 
 
 if __name__ == '__main__':
