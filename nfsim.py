@@ -4,8 +4,9 @@
 # by Tomas Hlavacek (tmshlvck@gmail.com)
 
 
-debug=0
+debug=1
 status_file='/tmp/smartvalidator_sim'
+lock_file='/tmp/smartvalidator_lock'
 
 ports = [80,443,25,110,143,53]
 protocols = [6,17]
@@ -19,7 +20,8 @@ import getopt
 import csv
 import iptree
 import ipaddress
-
+import multiprocessing
+import os.path
 
 def dbg(text):
     if debug:
@@ -37,7 +39,13 @@ def decode_nfdump_time(filename):
     if base != 'nfcapd':
         raise Exception("Filename check failed. No basename found.")
 
-    return datetime.datetime(int(fnc[-4]), int(fnc[-3]), int(fnc[-2]), int(time[8:10]), int(time[10:]))
+    # (Y, M, D, H, M)
+    return datetime.datetime(int(time[0:4]), int(time[4:6]), int(time[6:8]), int(time[8:10]), int(time[10:]))
+
+
+def decode_hostname(filename):
+    fnc = filename.split(os.path.sep)
+    return fnc[-5]
 
 
 def sort_nfdump_files(files):
@@ -121,15 +129,15 @@ def process_nfdump_output(stdout):
 def process_records(records, fltr, srcfilename, outdir):
     header = ['date', 'duration', 'protocol', 'src', 'srcport', 'dst', 'dstport', 'packets', 'bytes', 'flows']
 
-    proto_packets = {p:0 for p in protocols}
-    proto_packets[None] = 0
-    proto_bytes = {p:0 for p in protocols}
-    proto_bytes[None] = 0
+    drop_proto_packets = {p:0 for p in (protocols + [None])}
+    accept_proto_packets = {p:0 for p in (protocols + [None])}
+    drop_proto_bytes = {p:0 for p in (protocols + [None])}
+    accept_proto_bytes = {p:0 for p in (protocols + [None])}
 
-    port_packets = {p:0 for p in ports}
-    port_packets[None] = 0
-    port_bytes = {p:0 for p in ports}
-    port_bytes[None] = 0
+    drop_port_packets = {p:0 for p in (ports + [None])}
+    accept_port_packets = {p:0 for p in (ports + [None])}
+    drop_port_bytes = {p:0 for p in (ports + [None])}
+    accept_port_bytes = {p:0 for p in (ports + [None])}
 
     def update(table, key, value):
         if key in table:
@@ -145,49 +153,44 @@ def process_records(records, fltr, srcfilename, outdir):
         ofw.writerow(header)
 
     for r in records:
-        if not fltr.lookupBest(r[3]) and not fltr.lookupBest(r[5]):
-            continue
+        if fltr.lookupBest(r[3]) and not fltr.lookupBest(r[5]): # ROV is dropping the flow
+            if ofw:
+                ofw.writerow(r)
 
-        # write CSV, compute summaries
-        if ofw:
-            ofw.writerow(r)
+            update(drop_proto_packets, r[2], r[7])
+            update(drop_proto_bytes, r[2], r[8])
 
-        update(proto_packets, r[2], r[7])
-        update(proto_bytes, r[2], r[8])
+            update(drop_port_packets, r[4], r[7])
+            update(drop_port_bytes, r[4], r[8])
 
-        update(port_packets, r[4], r[7])
-        update(port_bytes, r[4], r[8])
-        update(port_packets, r[6], r[7])
-        update(port_bytes, r[6], r[8])
+            if r[4] != r[6]:
+                update(drop_port_packets, r[6], r[7])
+                update(drop_port_bytes, r[6], r[8])
+        else: # ROV accepts the flow
+            update(accept_proto_packets, r[2], r[7])
+            update(accept_proto_bytes, r[2], r[8])
+
+            update(accept_port_packets, r[4], r[7])
+            update(accept_port_bytes, r[4], r[8])
+
+            if r[4] != r[6]:
+                update(accept_port_packets, r[6], r[7])
+                update(accept_port_bytes, r[6], r[8])
+
 
     if ofh:
         ofh.close()
 
-    # write report (now stdout, future to CSV)
-    #print("proto_packets")
-    #print(str(proto_packets))
-    #print("proto_bytes")
-    #print(str(proto_bytes))
-    #print("port_packets")
-    #print(str(port_packets))
-    #print("port_bytes")
-    #print(str(port_bytes))
-    return (proto_packets, proto_bytes, port_packets, port_bytes)
-
+    return (decode_nfdump_time(srcfilename), drop_proto_packets, drop_proto_bytes, drop_port_packets, drop_port_bytes, accept_proto_packets, accept_proto_bytes, accept_port_packets, accept_port_bytes)
 
 def decode_header():
-    return [["packets_proto_%d" % p for p in protocols]+["packets_proto_other"],
-            ["bytes_proto_%d" % p for p in protocols]+["bytes_proto_other"],
-            ["packets_port_%d" % p for p in ports]+["packets_port_other"],
-            ["bytes_port_%d" % p for p in ports]+["bytes_port_other"]]
+    return ["time", "router"]+["drop_packets_proto_%d" % p for p in protocols]+["drop_packets_proto_other"]+["drop_bytes_proto_%d" % p for p in protocols]+["drop_bytes_proto_other"]+["drop_packets_port_%d" % p for p in ports]+["drop_packets_port_other"]+["drop_bytes_port_%d" % p for p in ports]+["drop_bytes_port_other"]+["accept_packets_proto_%d" % p for p in protocols]+["accept_packets_proto_other"]+["accept_bytes_proto_%d" % p for p in protocols]+["accept_bytes_proto_other"]+["accept_packets_port_%d" % p for p in ports]+["accept_packets_port_other"]+["accept_bytes_port_%d" % p for p in ports]+["accept_bytes_port_other"]
 
 
-def decode_rep(report):
-    (proto_packets, proto_bytes, port_packets, port_bytes) = report
-    return [[proto_packets[k] for k in (protocols + [None])],
-            [proto_bytes[k] for k in (protocols + [None])],
-            [port_packets[k] for k in (ports + [None])],
-            [port_bytes[k] for k in (ports + [None])]]
+
+def decode_rep(report, filename):
+    (time, drop_proto_packets, drop_proto_bytes, drop_port_packets, drop_port_bytes, accept_proto_packets, accept_proto_bytes, accept_port_packets, accept_port_bytes) = report
+    return [time, decode_hostname(filename)]+[drop_proto_packets[k] for k in (protocols + [None])]+[drop_proto_bytes[k] for k in (protocols + [None])]+[drop_port_packets[k] for k in (ports + [None])]+[drop_port_bytes[k] for k in (ports + [None])]+[accept_proto_packets[k] for k in (protocols + [None])]+[accept_proto_bytes[k] for k in (protocols + [None])]+[accept_port_packets[k] for k in (ports + [None])]+[accept_port_bytes[k] for k in (ports + [None])]
 
 
 def run_nfdump(nfd_fn):
@@ -195,6 +198,67 @@ def run_nfdump(nfd_fn):
     p = subprocess.Popen(['nfdump', '-N', '-r', nfd_fn], stdout=subprocess.PIPE)
     res = process_nfdump_output(p.stdout)
     return (res, p)
+
+
+def worker(params):
+    try:
+        (fn, fltr, outdir) = params
+        dbg("worker started with %s"%fn)
+        (res, proc) = run_nfdump(fn)
+        rep = process_records(res, fltr, os.path.split(fn)[-1], outdir)
+        nfdump_exit_code = proc.wait()
+        dbg('nfdump exited with code %d'%nfdump_exit_code)
+
+        write_status(decode_nfdump_time(fn))
+
+        ret = decode_rep(rep, fn)
+        dbg("return from worker: %s"%ret)
+        return ret
+    except Exception as e:
+        print("Worker failed: %s"%e)
+        raise
+
+
+def run_sim(rootdir, fltrfn, outdir, reportfn):
+    fltr = read_filter(fltrfn)
+    files = filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
+    write_header = True
+    try:
+        if os.stat(reportfn).st_size > 0:
+            write_header = False
+    except:
+        pass
+
+    p = multiprocessing.Pool(processes=4)
+    with open(reportfn, 'a') as reportfh:
+        reportcsv = csv.writer(reportfh, quoting=csv.QUOTE_MINIMAL)
+        if write_header:
+            reportcsv.writerow(decode_header())
+
+        for res in p.map(worker, list(zip(files, [fltr]*len(files), [outdir]*len(files)))):
+        #for param in list(zip(files, [fltr]*len(files), [outdir]*len(files))):
+        #    res = worker(param)
+
+            dbg("writing result from map(workers): %s"%str(res))
+            reportcsv.writerow(res)
+
+    print("Finished files:")
+    for fn in files:
+        print(fn)
+
+
+
+def check_lock():
+    if not os.path.isfile(lock_file):
+        with open(lock_file, 'w') as lf:
+            lf.write(str(os.getpid()))
+        return True
+    else:
+        return False
+
+
+def release_lock():
+    os.remove(lock_file)
 
 
 def main():
@@ -241,25 +305,9 @@ def main():
     assert fltrfn, "missing filter option"
     assert reportfn, "missing report file name"
 
-    def worker(fn, fltr, outdir):
-        (res, proc) = run_nfdump(fn)
-        rep = process_records(res, fltr, os.path.split(fn)[-1], outdir)
-        #rep = process_records([], fltr, os.path.split(fn)[-1], outdir)
-        nfdump_exit_code = proc.wait()
-        dbg('nfdump exited with code %d'%nfdump_exit_code)
-
-        write_status(decode_nfdump_time(files[-1]))
-
-        return decode_rep(rep)
-
-
-    fltr = read_filter(fltrfn)
-    files = filter_newer(sort_nfdump_files(find_files(rootdir)), read_status())
-    with open(reportfn, 'w') as reportfh:
-        reportcsv = csv.writer(reportfh, quoting=csv.QUOTE_MINIMAL)
-        reportcsv.writerow(decode_header())
-        for fn in files:
-            reportcsv.writerow(worker(fn, fltr, outdir))
+    if check_lock():
+        run_sim(rootdir, fltrfn, outdir, reportfn)
+        release_lock()
 
 
 if __name__ == '__main__':
