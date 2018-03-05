@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #
-# BGPcrunch - BGP analysis toolset
-# Copyright (C) 2014-2015 Tomas Hlavacek (tmshlvck@gmail.com)
+# IRAS - Internet Routing Analysis System
+# Copyright (C) 2014-2018 Tomas Hlavacek (tmshlvck@gmail.com)
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -28,10 +28,6 @@
 
 import ipaddress
 
-# Constants
-
-DEBUG=True
-
 
 class _IPLookupTreeNode(object):
     """ Internal Node for the IPLookupTree. Should not be
@@ -51,7 +47,8 @@ class IPLookupTree(object):
         self.ipv6=ipv6
         self.root=_IPLookupTreeNode()
 
-    def _bits(self,chararray):
+    @staticmethod
+    def _bits(chararray):
         """ Convert 8-bit chars to list of bools (bits)
         :param chararray: 8-bit chars
         :returns: Iterator that yields bits
@@ -69,10 +66,9 @@ class IPLookupTree(object):
         :param net: IPv4/6 prefix
         :param data: Bound data (arbitrary) object
         """
-        if not (isinstance(net, ipaddress.IPv4Network) or isinstance(net, ipaddress.IPv6Network)):
-            net = ipaddress.ip_network(net)
-
-        bits = list(self._bits(net.network_address.packed))
+    
+        net = IPLookupTree._normalize_pfx(net)
+        bits = list(IPLookupTree._bits(net.network_address.packed))
         index=self.root
         for bi in range(0,net.prefixlen):
             if bits[bi]:
@@ -86,6 +82,28 @@ class IPLookupTree(object):
         index.end = net
         index.data = data
 
+    @staticmethod
+    def _normalize_pfx(ip):
+        """
+            Create IPv4Network or IPv6Network out of a supplied prefix in the input string
+            or IPv4/6Address object.
+        """
+        if isinstance(ip, ipaddress.IPv4Network) or isinstance(ip, ipaddress.IPv6Network):
+            return ip
+        else:
+            return ipaddress.ip_network(ip)
+
+    @staticmethod
+    def _normalize_addr(ip):
+        """
+            Create IPv4Address or IPv6Address out of a supplied IPv46Network, string or address.
+        """
+        if isinstance(ip, ipaddress.IPv4Address) or isinstance(ip, ipaddress.IPv6Address):
+            return ip
+        elif isinstance(ip, ipaddress.IPv4Network) or isinstance(ip, ipaddress.IPv6Network):
+            return ip.network_address
+        else:
+            return ipaddress.ip_address(ip)
 
     def _lookupAllLevelsNode(self, ip, maxMatches=0):
         """ Internal match helper.
@@ -96,21 +114,14 @@ class IPLookupTree(object):
         :returns: List of resulting match candidate objects.
         """
 
-        if not (isinstance(ip, ipaddress.IPv4Network) or isinstance(ip, ipaddress.IPv6Network) or
-                isinstance(ip, ipaddress.IPv4Address) or isinstance(ip, ipaddress.IPv6Address)):
-            if str(ip).find('/') > 0:
-                ip = ipaddress.ip_network(ip)
-            else:
-                ip = ipaddress.ip_address(ip)
-    
-        limit=128 if self.ipv6 else 32
-        if isinstance(ip, ipaddress.IPv4Network) or isinstance(ip, ipaddress.IPv6Network):
-            limit=ip.prefixlen
+        ip = IPLookupTree._normalize_pfx(ip)
+        limit=ip.prefixlen
 
         index = self.root
         # match address
-        for (bi,b) in enumerate(self._bits(ip.packed)):
-            if index.end and ip in index.end: # match
+        a = IPLookupTree._normalize_addr(ip)
+        for (bi,b) in enumerate(IPLookupTree._bits(a.packed)):
+            if index.end and index.end.overlaps(ip): # match
                 yield index
 
             if bi >= limit or (maxMatches > 0 and len(candidates) >= maxMatches):
@@ -198,7 +209,7 @@ class IPLookupTree(object):
                 return
             
             if node.end:
-                print('%s %s' %(str(node.end), (str(node.data) if node.data else '')))
+                print('%s %s' %(str(node.end), str(node.data)))
                 
             printSubtree(node.zero)
             printSubtree(node.one)
